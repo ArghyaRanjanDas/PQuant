@@ -1,7 +1,7 @@
 from enum import Enum
-from typing import Annotated, Literal, Union
+from typing import Annotated, ClassVar, Literal, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class BasePruningModel(BaseModel):
@@ -77,6 +77,21 @@ class ConstraintType(str, Enum):
     GEQ = "GreaterThanOrEqual"
 
 
+# Both backends expose these implementation names in their own modules.
+METRIC_REGISTRY = {
+    MetricType.UNSTRUCTURED: "UnstructuredSparsityMetric",
+    MetricType.STRUCTURED: "StructuredSparsityMetric",
+    MetricType.FPGA_AWARE: "FPGAAwareSparsityMetric",
+    MetricType.PACA_PATTERN: "PACAPatternMetric",
+}
+
+CONSTRAINT_REGISTRY = {
+    ConstraintType.EQUALITY: "EqualityConstraint",
+    ConstraintType.LEQ: "LessThanOrEqualConstraint",
+    ConstraintType.GEQ: "GreaterThanOrEqualConstraint",
+}
+
+
 class BaseMetricModel(BaseModel):
     """Per-metric parameter block nested under MDMMPruningModel.metric.
 
@@ -86,21 +101,34 @@ class BaseMetricModel(BaseModel):
     branches on the metric type.
     """
 
+    model_config = ConfigDict(extra="forbid")
+    shared_fields: ClassVar[tuple[str, ...]] = ()
+
+    def runtime_kwargs(self, pruning_parameters: "MDMMPruningModel") -> dict[str, object]:
+        """Constructor arguments from this metric and the shared pruning settings."""
+        return {
+            **{name: getattr(pruning_parameters, name) for name in self.shared_fields},
+            **self.model_dump(exclude={"metric_type"}),
+        }
+
     def constraint_overrides(self):
         """(constraint_type, target_value) this metric mandates, or None."""
         return None
 
 
 class UnstructuredSparsityModel(BaseMetricModel):
-    metric_type: Literal["UnstructuredSparsity"] = "UnstructuredSparsity"
+    metric_type: Literal[MetricType.UNSTRUCTURED] = MetricType.UNSTRUCTURED
+    shared_fields = ("epsilon", "target_sparsity", "l0_mode", "scale_mode")
 
 
 class StructuredSparsityModel(BaseMetricModel):
-    metric_type: Literal["StructuredSparsity"] = "StructuredSparsity"
+    metric_type: Literal[MetricType.STRUCTURED] = MetricType.STRUCTURED
+    shared_fields = ("epsilon", "rf")
 
 
 class FPGAAwareSparsityModel(BaseMetricModel):
-    metric_type: Literal["FPGAAwareSparsity"] = "FPGAAwareSparsity"
+    metric_type: Literal[MetricType.FPGA_AWARE] = MetricType.FPGA_AWARE
+    shared_fields = ("epsilon", "rf", "l0_mode")
     precision: int = Field(default=16, ge=1)
     target_resource: Literal["DSP", "BRAM"] = Field(default="DSP")
     bram_width: int = Field(default=36, ge=1)
@@ -119,7 +147,8 @@ class FPGAAwareSparsityModel(BaseMetricModel):
 
 
 class PACAPatternModel(BaseMetricModel):
-    metric_type: Literal["PACAPatternSparsity"] = "PACAPatternSparsity"
+    metric_type: Literal[MetricType.PACA_PATTERN] = MetricType.PACA_PATTERN
+    shared_fields = ("epsilon",)
     num_patterns_to_keep: int = Field(default=16, ge=1)
     beta: float = Field(default=0.75, ge=0.0, le=1.0)
     distance_metric: Literal["hamming", "valued_hamming", "cosine"] = Field(default="valued_hamming")
@@ -134,11 +163,10 @@ MetricModel = Annotated[
     Field(discriminator="metric_type"),
 ]
 
-# Legacy flat layout: these keys used to live directly on MDMMPruningModel.
-_FLAT_METRIC_KEYS = ("precision", "target_resource", "bram_width", "num_patterns_to_keep", "beta", "distance_metric")
-
 
 class MDMMPruningModel(BasePruningModel):
+    model_config = ConfigDict(extra="forbid")
+
     pruning_method: Literal["mdmm"] = "mdmm"
     # Defaults must be the enum members, not bare strings: Pydantic does not validate
     # defaults, so a str default leaves the field holding a str at runtime and triggers
@@ -157,29 +185,6 @@ class MDMMPruningModel(BasePruningModel):
     l0_mode: Literal["coarse", "smooth"] = Field(default="coarse")
     scale_mode: Literal["mean", "sum"] = Field(default="mean")
     constraint_lr: float = Field(default=1.0e-3)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _accept_flat_metric_layout(cls, values):
-        # Back-compat with the flat layout, where metric_type and the per-metric
-        # parameters were siblings of the shared fields: lift them into the nested
-        # `metric` block. A config that already has `metric` is passed through as-is.
-        if not isinstance(values, dict) or "metric" in values:
-            return values
-        metric = {}
-        metric_type = values.pop("metric_type", None)
-        if metric_type is not None:
-            metric["metric_type"] = getattr(metric_type, "value", metric_type)
-        for key in _FLAT_METRIC_KEYS:
-            if values.get(key) is not None:
-                metric[key] = values.pop(key)
-        if metric:
-            values["metric"] = metric
-        return values
-
-    @property
-    def metric_type(self) -> MetricType:
-        return MetricType(self.metric.metric_type)
 
     @model_validator(mode="after")
     def _apply_metric_constraint_overrides(self):

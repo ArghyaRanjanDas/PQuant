@@ -11,35 +11,33 @@ import torch
 
 from pquant.core.constants import (
     CANONICAL_CONV_LAYOUT,
-    DISTANCE_COSINE,
-    DISTANCE_HAMMING,
-    DISTANCE_VALUED_HAMMING,
+    PACA_DISTANCE_METRICS,
 )
 from pquant.core.conv_layout import layout_perm
 
 _INF = 1e30
 
 
-def convert_conv_layout(w, src, dst=CANONICAL_CONV_LAYOUT):
+def convert_conv_layout(weight, src, dst=CANONICAL_CONV_LAYOUT):
     """Permute a 4D conv weight from `src` to `dst` layout (no-op if already equal)."""
-    perm = layout_perm(src, dst)
-    if src != dst or perm != (0, 1, 2, 3):
-        return w.permute(*perm).contiguous()
-    return w
+    permutation = layout_perm(src, dst)
+    if src != dst or permutation != (0, 1, 2, 3):
+        return weight.permute(*permutation).contiguous()
+    return weight
 
 
-def kernels_and_patterns(w, src, epsilon):
+def kernels_and_patterns(weight, src, epsilon):
     """Flatten a 4D conv weight to per-kernel rows and their binary support.
 
     Returns (kernels, patterns, (C_out, C_in, kH, kW)):
       kernels:  (C_out*C_in, kH*kW) float - flattened kernels, canonical OIHW order.
-      patterns: (C_out*C_in, kH*kW) uint8 - binary support, |w| > epsilon.
+      patterns: (C_out*C_in, kH*kW) uint8 - binary support, |weight| > epsilon.
     """
-    w_oihw = convert_conv_layout(w, src=src, dst=CANONICAL_CONV_LAYOUT)
-    c_out, c_in, kh, kw = w_oihw.shape
-    kernels = w_oihw.reshape(c_out * c_in, kh * kw)
+    weight_oihw = convert_conv_layout(weight, src=src, dst=CANONICAL_CONV_LAYOUT)
+    out_channels, in_channels, kernel_height, kernel_width = weight_oihw.shape
+    kernels = weight_oihw.reshape(out_channels * in_channels, kernel_height * kernel_width)
     patterns = (kernels.abs() > epsilon).to(torch.uint8)
-    return kernels, patterns, (c_out, c_in, kh, kw)
+    return kernels, patterns, (out_channels, in_channels, kernel_height, kernel_width)
 
 
 def select_dominant_patterns(patterns, num_patterns_to_keep, beta):
@@ -50,26 +48,31 @@ def select_dominant_patterns(patterns, num_patterns_to_keep, beta):
       valid:    (num_patterns_to_keep,)       bool  - which rows are real selections
                 (padding rows past the beta cut / distinct-pattern count are ignored).
     """
-    alpha = int(num_patterns_to_keep)
-    m, k = patterns.shape
-    if m == 0:
-        return patterns.new_zeros((alpha, k)), patterns.new_zeros((alpha,), dtype=torch.bool)
+    pattern_limit = int(num_patterns_to_keep)
+    num_kernels, pattern_size = patterns.shape
+    if num_kernels == 0:
+        return patterns.new_zeros((pattern_limit, pattern_size)), patterns.new_zeros((pattern_limit,), dtype=torch.bool)
 
-    uniq, counts = torch.unique(patterns, dim=0, return_counts=True)   # (U, K), (U,)
-    pdf = counts.to(torch.float32) / float(m)
-    order = torch.argsort(pdf, descending=True)
-    uniq, pdf = uniq[order], pdf[order]
-    cdf = torch.cumsum(pdf, dim=0)
+    unique_patterns, counts = torch.unique(patterns, dim=0, return_counts=True)  # (U, K), (U,)
+    frequencies = counts.to(torch.float32) / float(num_kernels)
+    order = torch.argsort(frequencies, descending=True)
+    unique_patterns, frequencies = unique_patterns[order], frequencies[order]
+    cumulative_frequency = torch.cumsum(frequencies, dim=0)
 
-    reaches = cdf >= beta
-    n_beta = int(torch.argmax(reaches.to(torch.int32))) + 1 if bool(reaches.any()) else uniq.shape[0]
-    keep = min(n_beta, uniq.shape[0], alpha)
+    coverage_reached = cumulative_frequency >= beta
+    patterns_for_coverage = (
+        int(torch.argmax(coverage_reached.to(torch.int32))) + 1 if bool(coverage_reached.any()) else unique_patterns.shape[0]
+    )
+    patterns_to_keep = min(patterns_for_coverage, unique_patterns.shape[0], pattern_limit)
 
-    dom = uniq[:alpha]
-    if dom.shape[0] < alpha:
-        dom = torch.cat([dom, dom.new_zeros((alpha - dom.shape[0], k))], dim=0)
-    valid = torch.arange(alpha, device=patterns.device) < keep
-    return dom, valid
+    dominant_patterns = unique_patterns[:pattern_limit]
+    if dominant_patterns.shape[0] < pattern_limit:
+        dominant_patterns = torch.cat(
+            [dominant_patterns, dominant_patterns.new_zeros((pattern_limit - dominant_patterns.shape[0], pattern_size))],
+            dim=0,
+        )
+    valid = torch.arange(pattern_limit, device=patterns.device) < patterns_to_keep
+    return dominant_patterns, valid
 
 
 def _hamming_distance(kernel_support, kernel_values, dominant_support):
@@ -87,41 +90,36 @@ def _cosine_distance(kernel_support, kernel_values, dominant_support):
     return 1.0 - dot / denom
 
 
-# Same keys as the keras twin (from core.constants); values are native-torch functions,
-# so the registry lives next to the implementations instead of in constants.py.
-DISTANCE_FN_REGISTRY = {
-    DISTANCE_HAMMING: _hamming_distance,
-    DISTANCE_VALUED_HAMMING: _valued_hamming_distance,
-    DISTANCE_COSINE: _cosine_distance,
-}
+# Shared names resolve to the distance functions implemented by this backend.
+DISTANCE_FN_REGISTRY = {distance: globals()[function_name] for distance, function_name in PACA_DISTANCE_METRICS.items()}
 
 
 def _kernel_pattern_distances(kernel_patterns, kernels, dominant_patterns, distance_metric):
-    """Distance from every kernel to every dominant pattern. -> (M_kernels, alpha)."""
-    kernel_support = kernel_patterns.to(kernels.dtype).unsqueeze(1)        # (M, 1, K)
-    kernel_values = kernels.unsqueeze(1)                                   # (M, 1, K)
-    dominant_support = dominant_patterns.to(kernels.dtype).unsqueeze(0)    # (1, alpha, K)
+    """Distance from every kernel to every dominant pattern. -> (M_kernels, pattern_limit)."""
+    kernel_support = kernel_patterns.to(kernels.dtype).unsqueeze(1)  # (M, 1, K)
+    kernel_values = kernels.unsqueeze(1)  # (M, 1, K)
+    dominant_support = dominant_patterns.to(kernels.dtype).unsqueeze(0)  # (1, pattern_limit, K)
     # distance_metric is validated by the Pydantic config model; a bad value on the
     # direct-construction path fails here as a missing registry key.
     return DISTANCE_FN_REGISTRY[distance_metric](kernel_support, kernel_values, dominant_support)
 
 
-def pattern_distances(w, dominant_patterns, valid_mask, src, epsilon, distance_metric):
+def pattern_distances(weight, dominant_patterns, valid_mask, src, epsilon, distance_metric):
     """Per-kernel distance to each dominant pattern, with invalid patterns masked to +inf."""
-    kernels, kernel_patterns, _ = kernels_and_patterns(w, src, epsilon)
+    kernels, kernel_patterns, _ = kernels_and_patterns(weight, src, epsilon)
     distances = _kernel_pattern_distances(kernel_patterns, kernels, dominant_patterns, distance_metric)
     distances = torch.where(valid_mask.unsqueeze(0), distances, distances.new_full((), _INF))
     return kernels, distances
 
 
-def projection_mask(w, dominant_patterns, valid_mask, src, epsilon, distance_metric):
-    """Binary mask (same layout as `w`) projecting each kernel onto its closest dominant pattern."""
-    if w.dim() != 4:
-        return torch.ones_like(w)
-    _, _, (c_out, c_in, kh, kw) = kernels_and_patterns(w, src, epsilon=0.0)
-    _, distances = pattern_distances(w, dominant_patterns, valid_mask, src, epsilon, distance_metric)
-    closest = torch.argmin(distances, dim=1)                  # (M,)
-    mask_flat = dominant_patterns[closest]                    # (M, K)
-    mask_oihw = mask_flat.reshape(c_out, c_in, kh, kw)
+def projection_mask(weight, dominant_patterns, valid_mask, src, epsilon, distance_metric):
+    """Binary mask (same layout as `weight`) projecting each kernel onto its closest dominant pattern."""
+    if weight.dim() != 4:
+        return torch.ones_like(weight)
+    _, _, (out_channels, in_channels, kernel_height, kernel_width) = kernels_and_patterns(weight, src, epsilon=0.0)
+    _, distances = pattern_distances(weight, dominant_patterns, valid_mask, src, epsilon, distance_metric)
+    closest = torch.argmin(distances, dim=1)  # (M,)
+    mask_flat = dominant_patterns[closest]  # (M, K)
+    mask_oihw = mask_flat.reshape(out_channels, in_channels, kernel_height, kernel_width)
     mask_src = convert_conv_layout(mask_oihw, src=CANONICAL_CONV_LAYOUT, dst=src)
-    return mask_src.to(w.dtype)
+    return mask_src.to(weight.dtype)

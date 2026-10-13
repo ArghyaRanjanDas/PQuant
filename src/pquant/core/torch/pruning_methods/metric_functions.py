@@ -1,24 +1,14 @@
-import abc
-
 import torch
 
 from pquant.core.constants import (
     DISTANCE_VALUED_HAMMING,
-    TARGET_RESOURCE_BRAM,
+    FPGA_TARGET_RESOURCES,
     TARGET_RESOURCE_DSP,
 )
 from pquant.core.torch.pruning_methods import patterns
 
 
-class BaseSparsityMetric(abc.ABC):
-    """Common interface for MDMM sparsity metrics: callable mapping a weight tensor to a scalar."""
-
-    @abc.abstractmethod
-    def __call__(self, weight):
-        raise NotImplementedError
-
-
-class UnstructuredSparsityMetric(BaseSparsityMetric):
+class UnstructuredSparsityMetric:
     """L0-L1 based metric — torch port of the keras version."""
 
     def __init__(self, l0_mode="coarse", scale_mode="mean", epsilon=1e-3, target_sparsity=0.8, alpha=100.0):
@@ -55,7 +45,7 @@ class UnstructuredSparsityMetric(BaseSparsityMetric):
         return self._scaling(fn_value, num_weights)
 
 
-class StructuredSparsityMetric(BaseSparsityMetric):
+class StructuredSparsityMetric:
     def __init__(self, rf=1, epsilon=1e-3):
         self.rf = int(rf)
         self.epsilon = float(epsilon)
@@ -74,7 +64,7 @@ class StructuredSparsityMetric(BaseSparsityMetric):
         return zero_groups.sum() / float(group_norms.numel())
 
 
-class FPGAAwareSparsityMetric(BaseSparsityMetric):
+class FPGAAwareSparsityMetric:
     """Hardware-aware sparsity metric for FPGA targets (torch port).
 
     Same semantics as the keras version: groups weights into DSP blocks (size ``rf``) and
@@ -86,8 +76,14 @@ class FPGAAwareSparsityMetric(BaseSparsityMetric):
     """
 
     def __init__(
-        self, rf=1, precision=16, target_resource=TARGET_RESOURCE_DSP, bram_width=36, epsilon=1e-3,
-        l0_mode='coarse', alpha=100.0,
+        self,
+        rf=1,
+        precision=16,
+        target_resource=TARGET_RESOURCE_DSP,
+        bram_width=36,
+        epsilon=1e-3,
+        l0_mode="coarse",
+        alpha=100.0,
     ):
         self.rf = int(rf)
         self.precision = int(precision)
@@ -97,10 +93,9 @@ class FPGAAwareSparsityMetric(BaseSparsityMetric):
         self.alpha = float(alpha)
         self.c = self._calculate_c()
         self._resource_sparsity = {
-            TARGET_RESOURCE_DSP: self._dsp_sparsity,
-            TARGET_RESOURCE_BRAM: self._bram_sparsity,
+            resource: getattr(self, method_name) for resource, method_name in FPGA_TARGET_RESOURCES.items()
         }
-        self._zero_count = self._coarse_zero_count if l0_mode == 'coarse' else self._smooth_zero_count
+        self._zero_count = self._coarse_zero_count if l0_mode == "coarse" else self._smooth_zero_count
 
     def _calculate_c(self):
         """Number of consecutive DSP groups packed into a single BRAM block."""
@@ -153,7 +148,7 @@ class FPGAAwareSparsityMetric(BaseSparsityMetric):
         return zero_bram.sum() / float(bram_norms.numel())
 
 
-class PACAPatternMetric(BaseSparsityMetric):
+class PACAPatternMetric:
     """Pattern-based pruning metric (PACA, torch port).
 
     Each call re-derives the dominant binary patterns from the current weights, then
@@ -181,9 +176,7 @@ class PACAPatternMetric(BaseSparsityMetric):
         if weight.dim() != 4:
             return torch.zeros((), dtype=weight.dtype, device=weight.device)
         dominant, valid = self._dominant_patterns(weight)
-        _, distances = patterns.pattern_distances(
-            weight, dominant, valid, self.src, self.epsilon, self.distance_metric
-        )
+        _, distances = patterns.pattern_distances(weight, dominant, valid, self.src, self.epsilon, self.distance_metric)
         return distances.min(dim=1).values.mean()
 
     def get_projection_mask(self, weight):

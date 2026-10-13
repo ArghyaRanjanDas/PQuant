@@ -32,7 +32,7 @@ def config():
             "enable_pruning": True,
             "constraint_type": "Equality",
             "target_value": 0.0,
-            "metric_type": "UnstructuredSparsity",
+            "metric": {"metric_type": "UnstructuredSparsity"},
             "target_sparsity": 0.5,
             "rf": 1,
             "epsilon": 1e-3,
@@ -101,16 +101,18 @@ class ConstantMetric:
 
 def test_equality_constraint():
     """metric=0.3, target=0.0 -> inf=0.3, penalty=1*(0.3 + 0.09/2)=0.345."""
-    constraint = EqualityConstraint(metric_fn=ConstantMetric(0.3), target_value=0.0, scale=1.0, damping=1.0,
-                                    use_grad=False, lr=0.0)
+    constraint = EqualityConstraint(
+        metric_fn=ConstantMetric(0.3), target_value=0.0, scale=1.0, damping=1.0, use_grad=False, lr=0.0
+    )
     dummy = ops.zeros((2, 2))
     constraint.build(dummy.shape)
     assert ops.abs(constraint(dummy) - 0.345) < 1e-5
 
 
 def test_leq_constraint_satisfied():
-    constraint = LessThanOrEqualConstraint(metric_fn=ConstantMetric(0.3), target_value=0.5, scale=1.0, damping=1.0,
-                                           use_grad=False, lr=0.0)
+    constraint = LessThanOrEqualConstraint(
+        metric_fn=ConstantMetric(0.3), target_value=0.5, scale=1.0, damping=1.0, use_grad=False, lr=0.0
+    )
     dummy = ops.zeros((2, 2))
     constraint.build(dummy.shape)
     assert ops.abs(constraint(dummy)) < 1e-6
@@ -118,16 +120,18 @@ def test_leq_constraint_satisfied():
 
 def test_leq_constraint_violated():
     """metric=0.7, target=0.5 -> inf=0.2, penalty=0.22."""
-    constraint = LessThanOrEqualConstraint(metric_fn=ConstantMetric(0.7), target_value=0.5, scale=1.0, damping=1.0,
-                                           use_grad=False, lr=0.0)
+    constraint = LessThanOrEqualConstraint(
+        metric_fn=ConstantMetric(0.7), target_value=0.5, scale=1.0, damping=1.0, use_grad=False, lr=0.0
+    )
     dummy = ops.zeros((2, 2))
     constraint.build(dummy.shape)
     assert ops.abs(constraint(dummy) - 0.22) < 1e-5
 
 
 def test_geq_constraint_satisfied():
-    constraint = GreaterThanOrEqualConstraint(metric_fn=ConstantMetric(0.7), target_value=0.5, scale=1.0, damping=1.0,
-                                              use_grad=False, lr=0.0)
+    constraint = GreaterThanOrEqualConstraint(
+        metric_fn=ConstantMetric(0.7), target_value=0.5, scale=1.0, damping=1.0, use_grad=False, lr=0.0
+    )
     dummy = ops.zeros((2, 2))
     constraint.build(dummy.shape)
     assert ops.abs(constraint(dummy)) < 1e-6
@@ -135,8 +139,9 @@ def test_geq_constraint_satisfied():
 
 def test_geq_constraint_violated():
     """metric=0.3, target=0.5 -> inf=0.2, penalty=0.22."""
-    constraint = GreaterThanOrEqualConstraint(metric_fn=ConstantMetric(0.3), target_value=0.5, scale=1.0, damping=1.0,
-                                              use_grad=False, lr=0.0)
+    constraint = GreaterThanOrEqualConstraint(
+        metric_fn=ConstantMetric(0.3), target_value=0.5, scale=1.0, damping=1.0, use_grad=False, lr=0.0
+    )
     dummy = ops.zeros((2, 2))
     constraint.build(dummy.shape)
     assert ops.abs(constraint(dummy) - 0.22) < 1e-5
@@ -144,8 +149,9 @@ def test_geq_constraint_violated():
 
 def test_constraint_turn_off():
     """After turn_off(), penalty should be 0."""
-    constraint = EqualityConstraint(metric_fn=ConstantMetric(0.5), target_value=0.0, scale=10.0, damping=5.0,
-                                    use_grad=False, lr=0.0)
+    constraint = EqualityConstraint(
+        metric_fn=ConstantMetric(0.5), target_value=0.0, scale=10.0, damping=5.0, use_grad=False, lr=0.0
+    )
     dummy = ops.zeros((2, 2))
     constraint.build(dummy.shape)
     constraint.turn_off()
@@ -154,8 +160,9 @@ def test_constraint_turn_off():
 
 def test_constraint_lambda_update_no_grad():
     """With lr>0, lambda updates between calls, changing the penalty."""
-    constraint = EqualityConstraint(metric_fn=ConstantMetric(0.3), target_value=0.0, scale=2.0, damping=1.0,
-                                    use_grad=False, lr=0.1)
+    constraint = EqualityConstraint(
+        metric_fn=ConstantMetric(0.3), target_value=0.0, scale=2.0, damping=1.0, use_grad=False, lr=0.1
+    )
     dummy = ops.zeros((2, 2))
     constraint.build(dummy.shape)
     result1 = constraint(dummy, training=True)

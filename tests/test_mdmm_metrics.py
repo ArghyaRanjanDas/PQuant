@@ -6,6 +6,9 @@ HWIO kernel layout.
 """
 
 import math
+import warnings
+from importlib import import_module
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -16,7 +19,7 @@ from pquant.core.keras.pruning_methods import patterns
 from pquant.core.keras.pruning_methods.constraint_functions import EqualityConstraint
 from pquant.core.keras.pruning_methods.mdmm import MDMM
 from pquant.core.keras.pruning_methods.metric_functions import FPGAAwareSparsityMetric, PACAPatternMetric
-from pquant.data_models.pruning_model import MDMMPruningModel
+from pquant.data_models.pruning_model import ConstraintType, MDMMPruningModel, MetricType
 
 
 @pytest.fixture
@@ -28,7 +31,7 @@ def base_config():
             "enable_pruning": True,
             "constraint_type": "Equality",
             "target_value": 0.0,
-            "metric_type": "UnstructuredSparsity",
+            "metric": {"metric_type": "UnstructuredSparsity"},
             "target_sparsity": 0.5,
             "rf": 1,
             "epsilon": 1e-3,
@@ -42,16 +45,16 @@ def base_config():
 
 def _make_conv_weight(kh=3, kw=3, c_in=2, c_out=4, seed=42):
     """Keras conv kernel: HWIO layout (kH, kW, C_in, C_out)."""
-    rng = np.random.default_rng(seed)
-    return ops.convert_to_tensor(rng.standard_normal((kh, kw, c_in, c_out)).astype(np.float32))
+    random_generator = np.random.default_rng(seed)
+    return ops.convert_to_tensor(random_generator.standard_normal((kh, kw, c_in, c_out)).astype(np.float32))
 
 
 def _conv_weight_for_mdmm():
     """HWIO weight with half the (out-channel) kernels zeroed for a non-trivial mask."""
-    rng = np.random.default_rng(0)
-    arr = rng.standard_normal((3, 3, 4, 4)).astype(np.float32)
-    arr[..., :2] = 0.0  # zero half the output channels
-    return ops.convert_to_tensor(arr)
+    random_generator = np.random.default_rng(0)
+    weight = random_generator.standard_normal((3, 3, 4, 4)).astype(np.float32)
+    weight[..., :2] = 0.0  # zero half the output channels
+    return ops.convert_to_tensor(weight)
 
 
 # --- FPGAAwareSparsityMetric ---
@@ -110,13 +113,15 @@ def test_paca_returns_zero_for_non_4d():
 
 
 def test_paca_patterns_follow_current_weights():
-    """No first-call latch: a used metric agrees with a fresh one on new weights."""
-    used = PACAPatternMetric(num_patterns_to_keep=4, beta=0.75, src="HWIO")
-    _ = used(_make_conv_weight())
-    sparse = _conv_weight_for_mdmm()
-    fresh = PACAPatternMetric(num_patterns_to_keep=4, beta=0.75, src="HWIO")
+    """A previously evaluated metric must recompute patterns for the current weights."""
+    evaluated_metric = PACAPatternMetric(num_patterns_to_keep=4, beta=0.75, src="HWIO")
+    evaluated_metric(_make_conv_weight())
+    sparse_weight = _conv_weight_for_mdmm()
+    reference_metric = PACAPatternMetric(num_patterns_to_keep=4, beta=0.75, src="HWIO")
     np.testing.assert_allclose(
-        ops.convert_to_numpy(used(sparse)), ops.convert_to_numpy(fresh(sparse)), rtol=1e-6
+        ops.convert_to_numpy(evaluated_metric(sparse_weight)),
+        ops.convert_to_numpy(reference_metric(sparse_weight)),
+        rtol=1e-6,
     )
 
 
@@ -153,6 +158,22 @@ def test_paca_invalid_distance_metric_raises_on_call():
 # --- Pattern helpers ---
 
 
+@pytest.mark.parametrize("backend", ["keras", "torch"])
+@pytest.mark.parametrize("distance_metric,expected", [("hamming", 1.0), ("valued_hamming", 4.0), ("cosine", 0.4)])
+def test_pattern_distance_dispatch(backend, distance_metric, expected):
+    """The shared distance names must resolve to the intended formula in each backend."""
+    import torch
+
+    pattern_module = import_module(f"pquant.core.{backend}.pruning_methods.patterns")
+    to_tensor = ops.convert_to_tensor if backend == "keras" else torch.as_tensor
+    kernels = to_tensor(np.array([[3.0, 4.0]], dtype=np.float32))
+    kernel_patterns = to_tensor(np.array([[1, 1]], dtype=np.uint8))
+    dominant_patterns = to_tensor(np.array([[1, 0]], dtype=np.uint8))
+    distances = pattern_module._kernel_pattern_distances(kernel_patterns, kernels, dominant_patterns, distance_metric)
+    actual = ops.convert_to_numpy(distances) if backend == "keras" else distances.detach().cpu().numpy()
+    np.testing.assert_allclose(actual, [[expected]], atol=1e-6)
+
+
 def test_patterns_kernels_and_patterns():
     """Flatten per-kernel and binarize by epsilon (explicit OIHW input)."""
     weight = ops.convert_to_tensor(np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32))  # (1,1,2,2)
@@ -164,11 +185,9 @@ def test_patterns_kernels_and_patterns():
 def test_patterns_select_dominant_returns_fixed_size_with_validity():
     """select_dominant_patterns returns (num_patterns_to_keep, K) + a validity mask."""
     # 6 identical-support rows + 2 of another support -> 2 distinct patterns.
-    pats = ops.convert_to_tensor(
-        np.array([[1, 1, 0, 0]] * 6 + [[0, 0, 1, 1]] * 2, dtype=np.uint8)
-    )
-    dom, valid = patterns.select_dominant_patterns(pats, num_patterns_to_keep=4, beta=0.99)
-    assert tuple(ops.shape(dom)) == (4, 4)
+    kernel_patterns = ops.convert_to_tensor(np.array([[1, 1, 0, 0]] * 6 + [[0, 0, 1, 1]] * 2, dtype=np.uint8))
+    dominant_patterns, valid = patterns.select_dominant_patterns(kernel_patterns, num_patterns_to_keep=4, beta=0.99)
+    assert tuple(ops.shape(dominant_patterns)) == (4, 4)
     valid_np = ops.convert_to_numpy(valid)
     assert valid_np[:2].all() and not valid_np[2:].any()  # exactly 2 distinct patterns are valid
 
@@ -178,7 +197,10 @@ def test_patterns_select_dominant_returns_fixed_size_with_validity():
 
 def test_mdmm_fpga_full_phase_cycle(base_config):
     base_config["pruning_parameters"].update(
-        {"metric_type": "FPGAAwareSparsity", "precision": 16, "target_resource": "DSP", "bram_width": 36, "rf": 2}
+        {
+            "metric": {"metric_type": "FPGAAwareSparsity", "precision": 16, "target_resource": "DSP", "bram_width": 36},
+            "rf": 2,
+        }
     )
     weight = _conv_weight_for_mdmm()
     mdmm = MDMM(base_config, "conv")
@@ -198,8 +220,16 @@ def test_mdmm_fpga_full_phase_cycle(base_config):
 def test_mdmm_paca_forces_equality_constraint(base_config):
     """PACA always pairs with EqualityConstraint(target=0), even if config asks for GEQ/99."""
     base_config["pruning_parameters"].update(
-        {"metric_type": "PACAPatternSparsity", "constraint_type": "GreaterThanOrEqual", "target_value": 99.0,
-         "num_patterns_to_keep": 4, "beta": 0.85, "distance_metric": "cosine"}
+        {
+            "metric": {
+                "metric_type": "PACAPatternSparsity",
+                "num_patterns_to_keep": 4,
+                "beta": 0.85,
+                "distance_metric": "cosine",
+            },
+            "constraint_type": "GreaterThanOrEqual",
+            "target_value": 99.0,
+        }
     )
     mdmm = MDMM(base_config, "conv")
     mdmm.build(_conv_weight_for_mdmm().shape)
@@ -210,7 +240,14 @@ def test_mdmm_paca_forces_equality_constraint(base_config):
 def test_mdmm_paca_full_phase_cycle(base_config):
     """PACA: metric evaluates on every call; finetuning output = weight * binary mask."""
     base_config["pruning_parameters"].update(
-        {"metric_type": "PACAPatternSparsity", "num_patterns_to_keep": 4, "beta": 0.85, "distance_metric": "cosine"}
+        {
+            "metric": {
+                "metric_type": "PACAPatternSparsity",
+                "num_patterns_to_keep": 4,
+                "beta": 0.85,
+                "distance_metric": "cosine",
+            }
+        }
     )
     weight = _conv_weight_for_mdmm()
     mdmm = MDMM(base_config, "conv")
@@ -232,72 +269,198 @@ def test_mdmm_paca_full_phase_cycle(base_config):
 # --- Pydantic schema validation (backend-agnostic) ---
 
 
-def test_pydantic_accepts_new_metric_types():
-    """The legacy flat layout is lifted into the nested metric block."""
-    fpga = MDMMPruningModel(metric_type="FPGAAwareSparsity", precision=16, target_resource="DSP", bram_width=36)
-    assert fpga.metric_type.value == "FPGAAwareSparsity" and fpga.metric.precision == 16
-    paca = MDMMPruningModel(metric_type="PACAPatternSparsity", num_patterns_to_keep=8, beta=0.9, distance_metric="hamming")
-    assert paca.metric_type.value == "PACAPatternSparsity" and paca.metric.beta == 0.9
+@pytest.mark.parametrize(
+    "metric_type,expected_parameters",
+    [
+        (MetricType.UNSTRUCTURED, {}),
+        (MetricType.STRUCTURED, {}),
+        (MetricType.FPGA_AWARE, {"precision": 16, "target_resource": "DSP", "bram_width": 36}),
+        (MetricType.PACA_PATTERN, {"num_patterns_to_keep": 16, "beta": 0.75, "distance_metric": "valued_hamming"}),
+    ],
+)
+def test_pydantic_metric_defaults(metric_type, expected_parameters):
+    pruning_parameters = MDMMPruningModel(metric={"metric_type": metric_type.value})
+    assert pruning_parameters.metric.metric_type is metric_type
+    assert pruning_parameters.metric.model_dump(exclude={"metric_type"}) == expected_parameters
 
 
-def test_pydantic_nested_metric_layout():
-    """The nested layout is the canonical one; per-metric params live in the sub-model."""
-    m = MDMMPruningModel(metric={"metric_type": "FPGAAwareSparsity", "precision": 8, "target_resource": "BRAM"})
-    assert m.metric.precision == 8 and m.metric.bram_width == 36
-    assert m.metric_type.value == "FPGAAwareSparsity"
-    default = MDMMPruningModel()
-    assert default.metric_type.value == "UnstructuredSparsity"
+def test_pydantic_default_mdmm_parameters():
+    pruning_parameters = MDMMPruningModel()
+    assert pruning_parameters.metric.metric_type is MetricType.UNSTRUCTURED
+    assert pruning_parameters.constraint_type is ConstraintType.EQUALITY
+    assert pruning_parameters.target_value == 0.0
+    assert pruning_parameters.target_sparsity == 0.9
+    assert pruning_parameters.rf == 1
+    assert pruning_parameters.epsilon == 1e-3
+    assert pruning_parameters.scale == 10.0
+    assert pruning_parameters.damping == 1.0
+    assert pruning_parameters.use_grad is False
+    assert pruning_parameters.l0_mode == "coarse"
+    assert pruning_parameters.scale_mode == "mean"
+    assert pruning_parameters.constraint_lr == 1e-3
+
+
+@pytest.mark.parametrize(
+    "pruning_parameters,unexpected_field",
+    [
+        ({"metric_type": "UnstructuredSparsity"}, "metric_type"),
+        ({"metric_type": "FPGAAwareSparsity", "precision": 8}, "precision"),
+        ({"metric": {"metric_type": "FPGAAwareSparsity"}, "precision": 8}, "precision"),
+        ({"metric": {"metric_type": "PACAPatternSparsity"}, "metric_type": "UnstructuredSparsity"}, "metric_type"),
+    ],
+)
+def test_pydantic_rejects_flat_metric_fields(pruning_parameters, unexpected_field):
+    """Stale flat fields must fail visibly, including when a nested metric is present."""
+    with pytest.raises(ValidationError) as caught:
+        MDMMPruningModel(**pruning_parameters)
+    assert any(error["type"] == "extra_forbidden" and error["loc"] == (unexpected_field,) for error in caught.value.errors())
+
+
+@pytest.mark.parametrize(
+    "pruning_parameters,unexpected_field",
+    [
+        ({"typo": 1}, "typo"),
+        ({"metric": {"metric_type": "UnstructuredSparsity", "typo": 1}}, "typo"),
+        ({"metric": {"metric_type": "FPGAAwareSparsity", "epsilon": 0.1}}, "epsilon"),
+        ({"metric": {"metric_type": "FPGAAwareSparsity", "beta": 0.9}}, "beta"),
+        ({"metric": {"metric_type": "PACAPatternSparsity", "precision": 8}}, "precision"),
+    ],
+)
+def test_pydantic_rejects_unknown_or_misplaced_fields(pruning_parameters, unexpected_field):
+    with pytest.raises(ValidationError) as caught:
+        MDMMPruningModel(**pruning_parameters)
+    assert any(
+        error["type"] == "extra_forbidden" and error["loc"][-1] == unexpected_field for error in caught.value.errors()
+    )
+
+
+@pytest.mark.parametrize("backend", ["keras", "torch"])
+@pytest.mark.parametrize(
+    "metric_config,class_name,expected_kwargs",
+    [
+        (
+            {"metric_type": "UnstructuredSparsity"},
+            "UnstructuredSparsityMetric",
+            {"epsilon": 0.02, "target_sparsity": 0.65, "l0_mode": "smooth", "scale_mode": "sum"},
+        ),
+        (
+            {"metric_type": "StructuredSparsity"},
+            "StructuredSparsityMetric",
+            {"epsilon": 0.02, "rf": 3},
+        ),
+        (
+            {"metric_type": "FPGAAwareSparsity", "precision": 8, "target_resource": "BRAM", "bram_width": 18},
+            "FPGAAwareSparsityMetric",
+            {"epsilon": 0.02, "rf": 3, "l0_mode": "smooth", "precision": 8, "target_resource": "BRAM", "bram_width": 18},
+        ),
+        (
+            {"metric_type": "PACAPatternSparsity", "num_patterns_to_keep": 7, "beta": 0.9, "distance_metric": "hamming"},
+            "PACAPatternMetric",
+            {"epsilon": 0.02, "num_patterns_to_keep": 7, "beta": 0.9, "distance_metric": "hamming"},
+        ),
+    ],
+)
+def test_mdmm_routes_metric_parameters_to_backend(backend, metric_config, class_name, expected_kwargs):
+    """Each backend must construct the selected metric with its complete supported parameters."""
+    mdmm_module = import_module(f"pquant.core.{backend}.pruning_methods.mdmm")
+    metric_module = import_module(f"pquant.core.{backend}.pruning_methods.metric_functions")
+    metric_class = getattr(metric_module, class_name)
+    config = {
+        "pruning_parameters": {
+            "pruning_method": "mdmm",
+            "metric": metric_config,
+            "epsilon": 0.02,
+            "target_sparsity": 0.65,
+            "rf": 3,
+            "l0_mode": "smooth",
+            "scale_mode": "sum",
+        }
+    }
+    with patch.object(metric_module, class_name, wraps=metric_class) as constructor:
+        mdmm = mdmm_module.MDMM(config, "conv")
+        mdmm.build((4, 2, 3, 3))
+    constructor.assert_called_once_with(**expected_kwargs)
+    assert isinstance(mdmm.constraint_layer.metric_fn, metric_class)
 
 
 def test_pydantic_bram_packing_validated_at_load():
     """precision > 2*bram_width makes BRAM packing impossible; the sub-model rejects it."""
     with pytest.raises(ValidationError):
-        MDMMPruningModel(metric={"metric_type": "FPGAAwareSparsity", "precision": 128, "bram_width": 16, "target_resource": "BRAM"})
+        MDMMPruningModel(
+            metric={"metric_type": "FPGAAwareSparsity", "precision": 128, "bram_width": 16, "target_resource": "BRAM"}
+        )
     # Fine when the resource is DSP: the BRAM fields are unused.
-    MDMMPruningModel(metric={"metric_type": "FPGAAwareSparsity", "precision": 128, "bram_width": 16, "target_resource": "DSP"})
+    MDMMPruningModel(
+        metric={"metric_type": "FPGAAwareSparsity", "precision": 128, "bram_width": 16, "target_resource": "DSP"}
+    )
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    "metric_config,invalid_field",
     [
-        {"metric_type": "BogusMetric"},
-        {"target_resource": "LUT"},
-        {"distance_metric": "manhattan"},
-        {"precision": 0},
-        {"bram_width": 0},
-        {"num_patterns_to_keep": 0},
-        {"beta": 1.5},
-        {"beta": -0.1},
+        ({"metric_type": "FPGAAwareSparsity", "target_resource": "LUT"}, "target_resource"),
+        ({"metric_type": "PACAPatternSparsity", "distance_metric": "manhattan"}, "distance_metric"),
+        ({"metric_type": "FPGAAwareSparsity", "precision": 0}, "precision"),
+        ({"metric_type": "FPGAAwareSparsity", "bram_width": 0}, "bram_width"),
+        ({"metric_type": "PACAPatternSparsity", "num_patterns_to_keep": 0}, "num_patterns_to_keep"),
+        ({"metric_type": "PACAPatternSparsity", "beta": 1.5}, "beta"),
+        ({"metric_type": "PACAPatternSparsity", "beta": -0.1}, "beta"),
     ],
 )
-def test_pydantic_rejects_invalid_values(kwargs):
-    with pytest.raises(ValidationError):
-        MDMMPruningModel(**kwargs)
+def test_pydantic_rejects_invalid_values(metric_config, invalid_field):
+    with pytest.raises(ValidationError) as caught:
+        MDMMPruningModel(metric=metric_config)
+    assert any(error["loc"][-1] == invalid_field for error in caught.value.errors())
 
 
-def test_pydantic_paca_forces_equality_at_model_level():
-    """The model_validator coerces PACA to Equality/0 regardless of requested constraint."""
-    m = MDMMPruningModel(metric_type="PACAPatternSparsity", constraint_type="GreaterThanOrEqual", target_value=42.0)
-    assert m.constraint_type.value == "Equality" and m.target_value == 0.0
+def test_pydantic_rejects_unknown_metric_type():
+    with pytest.raises(ValidationError) as caught:
+        MDMMPruningModel(metric={"metric_type": "BogusMetric"})
+    assert caught.value.errors()[0]["type"] == "union_tag_invalid"
 
 
-def test_mdmm_config_serializes_without_warnings():
-    """Regression for the reported bug: MDMM configs must round-trip through model_dump
-    with no PydanticSerializationUnexpectedValue (constraint_type enum / discriminated union)."""
-    import warnings
+@pytest.mark.parametrize("metric_type", list(MetricType))
+@pytest.mark.parametrize("constraint_type", list(ConstraintType))
+def test_pydantic_constraint_override_precedence(metric_type, constraint_type):
+    """Only PACA overrides the requested constraint, after parsing the nested metric."""
+    pruning_parameters = MDMMPruningModel(
+        metric={"metric_type": metric_type}, constraint_type=constraint_type, target_value=42.0
+    )
+    if metric_type is MetricType.PACA_PATTERN:
+        assert pruning_parameters.constraint_type is ConstraintType.EQUALITY
+        assert pruning_parameters.target_value == 0.0
+    else:
+        assert pruning_parameters.constraint_type is constraint_type
+        assert pruning_parameters.target_value == 42.0
+
+
+@pytest.mark.parametrize(
+    "metric_config",
+    [
+        None,
+        {"metric_type": "StructuredSparsity"},
+        {"metric_type": "FPGAAwareSparsity", "precision": 8, "target_resource": "BRAM"},
+        {"metric_type": "PACAPatternSparsity", "num_patterns_to_keep": 8},
+    ],
+)
+def test_mdmm_config_serializes_without_warnings(metric_config):
+    """Nested configs round-trip without enum or discriminated-union serialization warnings."""
 
     from pquant.core.hyperparameter_optimization import PQConfig
 
-    cases = [
-        {},
-        {"metric_type": "FPGAAwareSparsity", "precision": 8, "target_resource": "DSP"},
-        {"metric_type": "PACAPatternSparsity", "num_patterns_to_keep": 8},
+    pruning_parameters = {"pruning_method": "mdmm"}
+    if metric_config is not None:
+        pruning_parameters["metric"] = metric_config
+    config = PQConfig.load_from_config({"pruning_parameters": pruning_parameters})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        serialized_config = config.model_dump(mode="json")
+        serialized_json = config.model_dump_json()
+    serialization_warnings = [
+        warning
+        for warning in caught
+        if "Serialization" in str(warning.message) or "serialized value" in str(warning.message)
     ]
-    for pp in cases:
-        cfg = PQConfig.load_from_config({"pruning_parameters": {"pruning_method": "mdmm", **pp}})
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            cfg.model_dump(mode="json")
-            cfg.model_dump_json()
-        serial = [w for w in caught if "Serialization" in str(w.message) or "serialized value" in str(w.message)]
-        assert not serial, f"serialization warnings for {pp}: {[str(w.message) for w in serial]}"
+    assert not serialization_warnings, [str(warning.message) for warning in serialization_warnings]
+    assert "metric_type" not in serialized_config["pruning_parameters"]
+    assert PQConfig.model_validate_json(serialized_json).model_dump(mode="json") == serialized_config
