@@ -9,8 +9,9 @@ KERAS_BACKEND="torch" pytest test_mdmm.py test_mdmm_metrics.py
 KERAS_BACKEND="torch" pytest test_torch_mdmm.py
 pytest test_wanda.py
 KERAS_BACKEND="torch" pytest test_wanda.py
+pytest test_torch_pruning_layers.py
+pytest test_quantizer_parity.py
 pytest test_keras_compression_layers.py
-DATA_FORMAT=channels_last pytest test_keras_compression_layers.py
 KERAS_BACKEND="torch" pytest test_torch_compression_layers.py
 KERAS_BACKEND=torch pytest test_torch_onnx_converter.py
 pytest test_keras_onnx_converter.py

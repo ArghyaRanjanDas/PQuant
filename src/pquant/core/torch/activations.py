@@ -1,5 +1,5 @@
 from math import prod
-from typing import Tuple, TypeVar, Union
+from typing import TypeVar
 
 import torch
 import torch.nn as nn
@@ -37,8 +37,8 @@ class PQActivation(nn.Module):
         self,
         config,
         activation="relu",
-        in_quant_bits: Tuple[T, T, T] = None,
-        out_quant_bits: Tuple[T, T, T] = None,
+        in_quant_bits: tuple[T, T, T] = None,
+        out_quant_bits: tuple[T, T, T] = None,
         quantize_input=True,
         quantize_output=False,
         enable_ebops=True,
@@ -128,6 +128,7 @@ class PQActivation(nn.Module):
 
         if self.use_multiplier:
             self.multiplier = nn.Parameter(torch.tensor(-1.0), requires_grad=True)
+        self.train(self.training)  # the new quantizers must follow the layer's current train/eval mode
 
     def get_input_quantization_bits(self):
         return self.input_quantizer.get_quantization_bits()
@@ -224,18 +225,18 @@ class PQSoftmax(nn.Module):
     def __init__(
         self,
         config,
-        axis: Union[int, Tuple[int, ...]] = -1,
+        axis: int | tuple[int, ...] = -1,
         stable: bool = True,
         input_scaler: float = 1.0,
         parallelization_factor: int = -1,
         quantize_input: bool = True,
         quantize_output: bool = False,
-        in_quant_bits: Tuple[T, T, T] = None,
-        out_quant_bits: Tuple[T, T, T] = None,
-        exp_in_quant_bits: Tuple[T, T, T] = None,
-        exp_out_quant_bits: Tuple[T, T, T] = None,
-        inv_in_quant_bits: Tuple[T, T, T] = None,
-        inv_out_quant_bits: Tuple[T, T, T] = None,
+        in_quant_bits: tuple[T, T, T] = None,
+        out_quant_bits: tuple[T, T, T] = None,
+        exp_in_quant_bits: tuple[T, T, T] = None,
+        exp_out_quant_bits: tuple[T, T, T] = None,
+        inv_in_quant_bits: tuple[T, T, T] = None,
+        inv_out_quant_bits: tuple[T, T, T] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
