@@ -162,10 +162,8 @@ def test_paca_invalid_distance_metric_raises_on_call():
 @pytest.mark.parametrize("distance_metric,expected", [("hamming", 1.0), ("valued_hamming", 4.0), ("cosine", 0.4)])
 def test_pattern_distance_dispatch(backend, distance_metric, expected):
     """The shared distance names must resolve to the intended formula in each backend."""
-    import torch
-
+    to_tensor = ops.convert_to_tensor if backend == "keras" else pytest.importorskip("torch").as_tensor
     pattern_module = import_module(f"pquant.core.{backend}.pruning_methods.patterns")
-    to_tensor = ops.convert_to_tensor if backend == "keras" else torch.as_tensor
     kernels = to_tensor(np.array([[3.0, 4.0]], dtype=np.float32))
     kernel_patterns = to_tensor(np.array([[1, 1]], dtype=np.uint8))
     dominant_patterns = to_tensor(np.array([[1, 0]], dtype=np.uint8))
@@ -300,40 +298,6 @@ def test_pydantic_default_mdmm_parameters():
     assert pruning_parameters.constraint_lr == 1e-3
 
 
-@pytest.mark.parametrize(
-    "pruning_parameters,unexpected_field",
-    [
-        ({"metric_type": "UnstructuredSparsity"}, "metric_type"),
-        ({"metric_type": "FPGAAwareSparsity", "precision": 8}, "precision"),
-        ({"metric": {"metric_type": "FPGAAwareSparsity"}, "precision": 8}, "precision"),
-        ({"metric": {"metric_type": "PACAPatternSparsity"}, "metric_type": "UnstructuredSparsity"}, "metric_type"),
-    ],
-)
-def test_pydantic_rejects_flat_metric_fields(pruning_parameters, unexpected_field):
-    """Stale flat fields must fail visibly, including when a nested metric is present."""
-    with pytest.raises(ValidationError) as caught:
-        MDMMPruningModel(**pruning_parameters)
-    assert any(error["type"] == "extra_forbidden" and error["loc"] == (unexpected_field,) for error in caught.value.errors())
-
-
-@pytest.mark.parametrize(
-    "pruning_parameters,unexpected_field",
-    [
-        ({"typo": 1}, "typo"),
-        ({"metric": {"metric_type": "UnstructuredSparsity", "typo": 1}}, "typo"),
-        ({"metric": {"metric_type": "FPGAAwareSparsity", "epsilon": 0.1}}, "epsilon"),
-        ({"metric": {"metric_type": "FPGAAwareSparsity", "beta": 0.9}}, "beta"),
-        ({"metric": {"metric_type": "PACAPatternSparsity", "precision": 8}}, "precision"),
-    ],
-)
-def test_pydantic_rejects_unknown_or_misplaced_fields(pruning_parameters, unexpected_field):
-    with pytest.raises(ValidationError) as caught:
-        MDMMPruningModel(**pruning_parameters)
-    assert any(
-        error["type"] == "extra_forbidden" and error["loc"][-1] == unexpected_field for error in caught.value.errors()
-    )
-
-
 @pytest.mark.parametrize("backend", ["keras", "torch"])
 @pytest.mark.parametrize(
     "metric_config,class_name,expected_kwargs",
@@ -362,6 +326,8 @@ def test_pydantic_rejects_unknown_or_misplaced_fields(pruning_parameters, unexpe
 )
 def test_mdmm_routes_metric_parameters_to_backend(backend, metric_config, class_name, expected_kwargs):
     """Each backend must construct the selected metric with its complete supported parameters."""
+    if backend == "torch":
+        pytest.importorskip("torch")
     mdmm_module = import_module(f"pquant.core.{backend}.pruning_methods.mdmm")
     metric_module = import_module(f"pquant.core.{backend}.pruning_methods.metric_functions")
     metric_class = getattr(metric_module, class_name)

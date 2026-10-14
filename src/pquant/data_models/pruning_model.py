@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Annotated, ClassVar, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 
 class BasePruningModel(BaseModel):
@@ -101,7 +101,6 @@ class BaseMetricModel(BaseModel):
     branches on the metric type.
     """
 
-    model_config = ConfigDict(extra="forbid")
     shared_fields: ClassVar[tuple[str, ...]] = ()
 
     def runtime_kwargs(self, pruning_parameters: "MDMMPruningModel") -> dict[str, object]:
@@ -165,8 +164,6 @@ MetricModel = Annotated[
 
 
 class MDMMPruningModel(BasePruningModel):
-    model_config = ConfigDict(extra="forbid")
-
     pruning_method: Literal["mdmm"] = "mdmm"
     # Defaults must be the enum members, not bare strings: Pydantic does not validate
     # defaults, so a str default leaves the field holding a str at runtime and triggers

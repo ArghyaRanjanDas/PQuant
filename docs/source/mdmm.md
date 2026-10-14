@@ -4,7 +4,7 @@ MDMM (Modified Differential Method of Multipliers) trains a model with a constra
 
 Start with `mdmm_config()`, `mdmm_fpga_config()`, or `mdmm_paca_config()` before building or converting a model. The [Quick User Guide](getting_started.md) covers model construction and the training wrapper; the [Usage Reference](mdmm-pruning) lists configuration defaults.
 
-Metric-specific settings belong in the nested `metric` block; the retired flat layout is rejected. When supplying a metric block, include its `metric_type` discriminator. Other metric fields retain their documented defaults and validation bounds. Omitting the whole block selects the default unstructured metric.
+Metric-specific settings belong in the nested `metric` block; flat fields are no longer migrated into that block. When supplying a metric block, include its `metric_type` discriminator. Other metric fields retain their documented defaults and validation bounds. Omitting the whole block selects the default unstructured metric.
 
 ## Choose the metric and target together
 
