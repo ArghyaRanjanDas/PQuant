@@ -45,6 +45,7 @@ exclude_patterns = ["_build"]
 html_logo = "_static/pquant.png"
 html_theme_options = {
     "logo_only": True,
+    "display_version": True,
 }
 
 html_context = {
